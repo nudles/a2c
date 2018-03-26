@@ -64,23 +64,27 @@ class RequestGenerator(object):
         return sorted(new_req, key=lambda tup: tup[1])
 
 
-class Action_Space:
+class Discrete:
     # only contains the value of batchsz
-    shape=(1,)
+    def __init__(self, num_output)
+        self.n = num_output 
 
 
-class Rafiki:
+class Env:
 
-    def __init__(self, batchsz, latency, perf, state_size=500):
-        self.requests=[]
+    def __init__(self, batchsz, latency_path, perf_path, obs_size=500):
+        self.latency = np.loadtxt(latency, delimiter=',')
+        self.perf = np.loadtxt(perf_path, delimiter=',')
         self.num_models = latency.shape[0]
-        self.state_size = state_size
+        self.obs_size = obs_size
+        self.state_size = 1
         self.batchsz = batchsz  # a list of candidate batchsz
         self.waiting_time=np.zeros((num_models, ))
 
+        assert len(batchsz) == latency.shape[1], 'batchsz %d not match latency shape' % len(batchsz)
         # the following two items is be compatible with OpenAI gym setting.
-        self.action_space=Action_Space()
-        self.observation_space=np.array([0] * self.state_size)
+        self.action_space=Discrete(self.num_models + math.log2(latency.shape[1]))
+        self.observation_space= np.zeros((self.obs_size + self.latency.size + self.num_models + 1, ))
 
         # we use self-defined timer
         self.timer=Timer(0)
@@ -93,16 +97,14 @@ class Rafiki:
         print('min process rate:', self.min_rate)
 
         self.tau = np.max(latency) * 2
-        num_of_iters = self.state_size / batchsz[-1]
+        num_of_iters = self.obs_size / batchsz[-1]
         T = num_of_iters * tau * 10
         # (pi/2 - asin(0.9)) / pi = 1 / 7 is the peak fraction
 
         # requests generation model, we use it to generate requests.
+        self.requests=[]
         self.requests_gen=RequestGenerator(self.timer, 5000, self.max_rate, self.min_rate, T)
         self.reset()
-
-    def state(self):
-    	return self.state
 
     def parse_action(self, action):
         # first num_models bits for model selection; the rest bits for batchsz index
@@ -114,7 +116,7 @@ class Rafiki:
 
     def step(self, action):
         """
-          :return: state s1 and cost c1
+          :return: obs s1 and cost c1
         """
         model_idx, batchsz_idx=self.parse_action(action)
         self.waiting_time[model_idx] += self.latency[model_idx, batchsz_idx]
@@ -132,20 +134,22 @@ class Rafiki:
         delta=np.min(self.waiting_time)
         self.timer.tick(delta)
         self.waiting_time -= delta
-        self.update_state()
-        # state, reward, done, _
-        return self.state, reward, False, {'acc': acc, 'overdue': num_overdue}
+        self.update_obs()
+        # obs, reward, done, _
+        return self.obs, reward, False, {'acc': acc, 'overdue': num_overdue}
 
-    def update_state(self):
+    def update_obs(self):
         new_req = self.requests_gen.get()
         total_size = len(new_req) + len(self.requests)
-        assert total_size < 10*self.state_size, 'too many requests %d' % total_size
+        assert total_size < 10*self.obs_size, 'too many requests %d' % total_size
     	self.requests.extend(new_req)
-        size = min(self.state_size, total_size)
-        self.state = np.zeros((self.state_size + self.latency.size + 1,))
-        self.state[:self.latency.size] = self.latency.reshape((-1,))
-        self.state[self.latency.size + 1] = self.tau
-        self.state[self.latency.size + 1 :] = self.timer.now() - np.array([r[1] for r in self.requests[:size]])
+        size = min(self.obs_size, total_size)
+        self.obs = np.zeros((self.obs_size + self.latency.size + self.num_models + 1,))
+        self.obs[0] = self.tau
+        self.obs[1:1+self.latency.size] = self.latency.reshape((-1,))
+        offset = 1 + self.latency.size + self.num_models
+        self.obs[1+self.latency.size: offset] = self.waiting_time
+        self.obs[offset: offset+size] = self.timer.now() - np.array([r[1] for r in self.requests[:size]])
 
     def accuracy(self, requests, model_idx):
         comb_id=model_idx.dot(1 << np.arange(model_idx.size)[::-1])
@@ -154,4 +158,30 @@ class Rafiki:
     def reset(self):
     	self.timer.reset()
     	self.timer.tick(self.tau)
-        return self.update_state(self)
+        return self.update_obs(self)
+
+
+class Envs(object):
+    def __init__(self, num_processes):
+        self.envs = [ Env(range(16, 65, 16), 'latency.npy', 'perf.npy', obs_size=500) for i in range(num_processes)]
+        self.observation_space = self.envs[0].observation_space
+        self.action_space = self.envs[0].action_space
+
+    def step(self, actions):
+        obs = np.empty((self.num_processes, self.observation_space.shape[0]))
+        reward = np.empty((self.num_processes))
+        done = np.empty((self.num_processes))
+        info = []
+        for k, env in enumerate(self.envs):
+            o, r, d, s = env.step(actions[k])
+            obs[i, :] = o
+            reward[i] = r
+            done[i] = d
+            info.append(s)
+        return obs, reward, done, info
+
+
+    def reset(self):
+        ret = np.empty((self.num_processes, self.observation_space.shape[0]))
+        for i, env in enumerate(self.envs):
+            ret[i, :] = env.reset()
