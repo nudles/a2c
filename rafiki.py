@@ -56,20 +56,13 @@ class RequestGenerator(object):
         num = int(np.around(num_float))
         self.num_float = num_float
 
-        if num == 0:
-            # no requests generated
-            # update
-            self.last_timestamp = self.timer.now()
-            return []
-        else:
-            # to make the requests unifromly located in [last_timestamp, now)
-            now = self.timer.now()
-            new_req = [(random.randint(0, self.val_size - 1), np.random.uniform(self.last_timestamp,
-                                                                                now) for i in range(num)]
-            # update
-            self.last_timestamp=self.timer.now()
-
-            return sorted(new_req, key=lambda tup: tup[1])
+        # to make the requests unifromly located in [last_timestamp, now)
+        now = self.timer.now()
+        new_req = [(random.randint(0, self.val_size - 1), np.random.randint(self.last_timestamp,
+                                                                            now-1) for i in range(num)]
+        # update
+        self.last_timestamp=self.timer.now()
+        return sorted(new_req, key=lambda tup: tup[1])
 
 
 class Action_Space:
@@ -94,47 +87,25 @@ class Rafiki:
         # an average speed for genearating model, to force the processing model
         # tend to take maximum batchsz
         self.max_rate=max([batchsz[-1] / l[-1] for l in self.latency])
-        self.min_rate=max([batchsz[0] / l[0] for l in self.latency])
+        self.min_rate=min([batchsz[0] / l[0] for l in self.latency])
         print('max process rate:', self.max_rate)
         print('min process rate:', self.min_rate)
 
         # requests generation model, we use it to generate requests.
         self.requests_model=RequestModel(
             self.timer, 5000, self.max_rate, self.min_rate)
-        # valid time for each requests, any requests must be processed before add_time+valid_time,
-        # otherwise it will be overdue and be removed from current requests list. The number of overdue requests
-        # will affect the reward of each step.
-        # valid time should be set a value which in-batch requests are destined to overdue when processing model tend to
-        # use maximum batchsz, which will be a trade-off for reinforcement learning to take a appropriate batchsz.
-        # it should be set a value  ranging from the minimum batch processing time to maximum batch processing time
-        # (0.011668896675109864, 0.12587196826934816)
-        # print('valid time range:',(self.process_model.data[self.process_model_idx][0],
-        #                                     self.process_model.data[self.process_model_idx][-1]))
-
         self.reset()
 
     def state(self):
     	return self.state
 
+
+    def parse_action(self, action):
+        
+
     def step(self, action):
         """
-        receive Action a0 and work on current environment, get a transition State s1 and Cost c1.
-        a0 + s0 => s1, c0
-        At the begining, we randomly give an action and get initial State s0. After that, we can input Action a0 and
-        then get new State s1 and Cost c0, and then generate new policy/action a1, and get s2/c1 in loop.
-        The transition from s0 => s1 will effect requests Stack we maintained.
-        We own independent time system in our system, so as to accelerate our training or testing process.
-        To synchronize with external world time system, you can choose to use exernal real timing.
-
-        When an action generated, let's say, a batch size is given by the policy, we get a series of requests id which indicate
-        the requests to be processed. We can judge that:
-        1. even though the request is in batch, it can be overdue when processed.
-        2. the request is not in batch, it can be overdue when currect batch is processed.
-        3. we only care about the overdue request in current step, namely from the action is given, to the action is
-        completed.
-
-        :param a0: action towards current state s0
-        :return: state s1 and cost c1
+          :return: state s1 and cost c1
         """
 
         model_index=action[:latency.shape[0]]
