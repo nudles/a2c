@@ -39,7 +39,7 @@ def get_args():
                         help='ppo clip parameter (default: 0.2)')
     parser.add_argument('--num-stack', type=int, default=4,
                         help='number of frames to stack (default: 4)')
-    parser.add_argument('--log-interval', type=int, default=10,
+    parser.add_argument('--log-interval', type=int, default=1000,
                         help='log interval, one log per n updates (default: 10)')
     parser.add_argument('--save-interval', type=int, default=100,
                         help='save interval, one save per n updates (default: 10)')
@@ -61,6 +61,14 @@ def get_args():
                         help='disables visdom visualization')
     parser.add_argument('--port', type=int, default=8097,
                         help='port to run the server on (default: 8097)')
+    parser.add_argument('--obs_size', type=int, default=500,
+                        help='observation vector size')
+    parser.add_argument('--sigma', type=float, default=0.1,
+                        help='variation of the min/max rate')
+    parser.add_argument('--epoch', type=int, default=3)
+    parser.add_argument('--debug', action='store_true')
+    parser.add_argument(
+        '--policy', choices=['async', 'sync'], default='sync', help='policy')
     args = parser.parse_args()
 
     args.cuda = not args.no_cuda and torch.cuda.is_available()

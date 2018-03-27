@@ -7,16 +7,9 @@ import logging
 import pathlib
 import datetime
 
+
 # create logger
 logger = logging.getLogger('Rafiki')
-logger.setLevel(logging.INFO)
-# create console handler
-ch = logging.StreamHandler()
-ch.setLevel(logging.INFO)
-formatter = logging.Formatter(
-    '%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-ch.setFormatter(formatter)
-logger.addHandler(ch)
 
 
 class Timer:
@@ -46,8 +39,6 @@ class RequestGenerator(object):
         # self.cur_req_id = 1
         self.timer = timer
         self.val_size = val_size
-        self.max_rate = max_rate
-        self.min_rate = min_rate
         self.T = T
         self.mu = mu
         # sin(0.5pi-0.2pi)*k + b = r; sin(0.5pi)*k + b = (1+sigma)*r
@@ -64,6 +55,9 @@ class RequestGenerator(object):
         num = math.sin(w * x) * self.k + self.b
         num = int(max(0, num * (1 + random.gauss(0, self.mu))))
         return int(num * delta)
+
+    def reset(self):
+        self.last_timestamp = self.timer.now()
 
     def get(self):
         """
@@ -87,6 +81,8 @@ class Discrete:
     def __init__(self, num_output):
         self.n = num_output
 
+env_id = 0
+
 
 class Env:
 
@@ -108,18 +104,19 @@ class Env:
         assert (1 << self.num_models) - \
             1 == self.perf.shape[0], 'num of models not math perf file'
         self.state_size = 1
-        self.waiting_time = np.zeros((self.num_models, ))
 
-        assert len(
-            batchsz) == self.num_batchsz, 'batchsz %d not match latency shape' % len(batchsz)
+        assert len(batchsz) == self.num_batchsz, \
+            'batchsz %d not match latency shape' % len(batchsz)
         # the following two items is be compatible with OpenAI gym setting.
         self.action_space = Discrete(
             ((1 << self.num_models) - 1) * self.num_batchsz)
         self.observation_space = np.zeros(
             (self.obs_size + self.latency.size + self.num_models + 1, ))
         # requests generation model, we use it to generate requests.
-        self.requests = []
         self.reset()
+        global env_id
+        self.logger = logging.getLogger('Rafiki.env-%d' % env_id)
+        env_id += 1
 
     def model_idx_to_model_action(self, model_idx):
         return model_idx.dot(1 << np.arange(model_idx.size)[::-1]) - 1
@@ -175,13 +172,29 @@ class Env:
         self.waiting_time -= delta
         self.update_obs()
         # obs, reward, done, _
-        return self.obs, reward, False, {'acc': acc, 'overdue': num_overdue, 'batchsz': num,
-                                         'num_models': sum(model_idx), 'time': cur_time}
+        self.logr += reward
+        self.logt += num
+        self.logo += num_overdue
+        self.loga += acc * num
+        delta = self.timer.now() - self.last_log_time
+        if delta >= 1:
+            self.logger.info('time %5.1f, reward %5.1f, acc %3.2f, overdue %5.1f, throughput %5.1f, arr rate %5.1f, queue size %d' %
+                             (self.timer.now(), self.logr / delta,
+                              self.loga / self.logt, self.logo / delta,
+                              self.logt / delta,
+                              self.requests_gen.num_of_new_requests(1),
+                              len(self.requests)))
+            self.last_log_time = self.timer.now()
+            self.logr, self.logt, self.logo, self.loga = 0, 0, 0, 0
+        return self.obs, reward, False, \
+            {'acc': acc, 'overdue': num_overdue, 'batchsz': num,
+             'num_models': sum(model_idx), 'time': cur_time}
 
     def update_obs(self):
         new_req = self.requests_gen.get()
         total_size = len(new_req) + len(self.requests)
-        assert total_size < 10 * self.obs_size, 'too many requests %d' % total_size
+        assert total_size < 10 * self.obs_size, \
+            'too many requests %d' % total_size
         self.requests.extend(new_req)
         size = min(self.obs_size, total_size)
         self.obs = np.zeros(
@@ -195,16 +208,45 @@ class Env:
 
     def reset(self):
         self.timer.reset()
+        self.requests_gen.reset()
+        self.requests = []
+        self.waiting_time = np.zeros((self.num_models, ))
+        self.last_log_time = self.timer.now()
+        self.logr, self.logt, self.logo, self.loga = 0, 0, 0, 0
         self.timer.tick(self.tau / 5)
-        return self.update_obs()
+        self.update_obs()
+        return self.obs
 
 
 class Envs(object):
 
-    def __init__(self, num_processes):
+    def __init__(self, num_processes, policy, obs_size):
         self.num_processes = num_processes
-        self.envs = [Env(range(16, 65, 16), 'latency.txt',
-                         'accuracy.txt', obs_size=500) for i in range(num_processes)]
+        batchsz = range(16, 65, 16)
+        latency = np.loadtxt('latency.txt', delimiter=',')
+        max_rate = sum([batchsz[-1] / l[-1] for l in latency])
+        # min when all models are running the same data
+        min_rate = min([batchsz[0] / l[0] for l in latency])
+        logger.info('max process rate: %f' % max_rate)
+        logger.info('min process rate: %f' % min_rate)
+
+        tau = np.max(latency) * 2
+        num_of_iters = obs_size / batchsz[-1]
+        T = num_of_iters * tau * 10
+        logger.info('sin cycle %f' % T)
+        # (pi/2 - asin(0.9)) / pi = 1 / 7 is the peak fraction
+        self.envs = []
+        for i in range(self.num_processes):
+            timer = Timer()
+            if policy == 'sync':
+                requests_gen = RequestGenerator(timer, 5000, min_rate, T)
+                env = Env(requests_gen, timer, batchsz,
+                          tau=tau, obs_size=obs_size)
+            else:
+                requests_gen = RequestGenerator(timer, 5000, max_rate, T)
+                env = Env(requests_gen, timer, batchsz,
+                          tau=tau, obs_size=obs_size)
+            self.envs.append(env)
         self.observation_space = self.envs[0].observation_space
         self.action_space = self.envs[0].action_space
 
@@ -251,57 +293,24 @@ def step(env, model_idx, sync):
 
 
 def sync_run(evn, stop_time):
-    last_timestamp = env.timer.now()
-    reward, throughput, overdue, acc = 0, 0, 0, 0
     while env.timer.now() < stop_time:
         _, r, _, info = step(env, np.ones((env.num_models), dtype=bool), True)
-        reward += r
-        throughput += info['batchsz']
-        overdue += info['overdue']
-        acc += info['acc'] * info['batchsz']
-        delta = info['time'] - last_timestamp
-        if delta >= 1:
-            logger.info('time %f, reward %f, acc %f, overdue %f, throughput %f, arr rate %f, queue size %d' %
-                        (info['time'], reward / delta, acc / throughput, overdue / delta,
-                         throughput / delta, env.requests_gen.num_of_new_requests(1), len(env.requests)))
-            last_timestamp = info['time']
-            reward = 0
-            throughput = 0
-            overdue = 0
-            acc = 0
 
 
 def async_run(env, stop_time):
     # always use all models
-    last_timestamp = env.timer.now()
-    reward, throughput, overdue, acc = 0, 0, 0, 0
     while env.timer.now() < stop_time:
         # choose biggest batchsz and smallest waiting queue
         model_action = np.zeros((env.num_models), dtype=bool)
         model_action[np.argmin(env.waiting_time)] = True
         # print(np.argmin(env.waiting_time))
         _, r, _, info = step(env, model_action, False)
-        reward += r
-        throughput += info['batchsz']
-        overdue += info['overdue']
-        acc += info['acc'] * info['batchsz']
-        delta = info['time'] - last_timestamp
-        if delta >= 1:
-            logger.info('time %f, reward %f, acc %f, overdue %f, throughput %f, arr rate %f, queue size %d' %
-                        (info['time'], reward / delta, acc / throughput, overdue / delta,
-                         throughput / delta, env.requests_gen.num_of_new_requests(1), len(env.requests)))
-            last_timestamp = info['time']
-            reward = 0
-            throughput = 0
-            overdue = 0
-            acc = 0
-
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description='Request serving policy optimization.')
     parser.add_argument(
-        '--policy', choices=['rl', 'async', 'sync'], default='rl', help='policy')
+        '--policy', choices=['async', 'sync'], default='rl', help='policy')
     parser.add_argument('--obs_size', type=int, default=500,
                         help='observation vector size')
     parser.add_argument('--sigma', type=float, default=0.1,
@@ -310,6 +319,16 @@ if __name__ == '__main__':
     parser.add_argument('--debug', action='store_true')
 
     args = parser.parse_args()
+
+    logger.setLevel(logging.INFO)
+    # create console handler
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    ch.setFormatter(formatter)
+    logger.addHandler(ch)
+
     if not args.debug:
         pathlib.Path('log').mkdir(parents=True, exist_ok=True)
         fh = logging.FileHandler('log/server-%s' %

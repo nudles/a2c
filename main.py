@@ -1,8 +1,9 @@
-import copy
 import glob
 import os
 import time
-
+import pathlib
+import logging
+import datetime
 #import gym
 import numpy as np
 import torch
@@ -21,12 +22,31 @@ from storage import RolloutStorage
 from visualize import visdom_plot
 import rafiki
 
+# create logger
+logger = logging.getLogger('Rafiki')
+logger.setLevel(logging.INFO)
+# create console handler
+ch = logging.StreamHandler()
+ch.setLevel(logging.INFO)
+formatter = logging.Formatter(
+    '%(asctime)s - %(name)s - %(message)s')
+ch.setFormatter(formatter)
+logger.addHandler(ch)
+
 args = get_args()
 
+if not args.debug:
+    pathlib.Path('log').mkdir(parents=True, exist_ok=True)
+    fh = logging.FileHandler('log/server-%s' %
+                             datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S"))
+    fh.setLevel(logging.DEBUG)
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
+logger.info(args)
+
 assert args.algo in ['a2c', 'ppo', 'acktr']
-if args.recurrent_policy:
-    assert args.algo in ['a2c', 'ppo'], \
-        'Recurrent policy is not implemented for ACKTR'
 
 num_updates = int(args.num_frames) // args.num_steps // args.num_processes
 
@@ -54,7 +74,7 @@ def main():
         viz = Visdom(port=args.port)
         win = None
 
-    envs = rafiki.Envs(args.num_processes)
+    envs = rafiki.Envs(args.num_processes, args.policy, args.obs_size)
     obs_shape = envs.observation_space.shape
     obs_shape = (obs_shape[0] * args.num_stack, *obs_shape[1:])
 
