@@ -201,3 +201,15 @@ class Envs(object):
         for i, env in enumerate(self.envs):
             ret[i, :] = env.reset()
         return ret
+
+
+def max_strategy(niter=1000):
+    env = Env()
+    for i in range(niter):
+        # choose biggest batchsz and smallest waiting queue
+        pass
+
+
+def min_strategy():
+    # always use all models
+    pass
