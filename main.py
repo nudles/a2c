@@ -70,7 +70,7 @@ def main():
     os.environ['OMP_NUM_THREADS'] = '1'
 
     envs = rafiki.Envs(args.num_processes, args.num_models, args.policy,
-                       args.obs_size, args.cycle_len)
+                       args.alpha1, args.obs_size, args.cycle_len)
     obs_shape = envs.observation_space.shape
 
     actor_critic = MLPPolicy(obs_shape[0], envs.action_space)

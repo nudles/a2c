@@ -67,6 +67,7 @@ def get_args():
                         help='observation vector size')
     parser.add_argument('--debug', action='store_true')
     parser.add_argument('--num_models', type=int, default=3)
+    parser.add_argument('--alpha1', type=float, default=0.5)
     parser.add_argument(
         '--policy', choices=['async', 'sync'], default='sync', help='policy')
 

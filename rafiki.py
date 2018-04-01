@@ -108,7 +108,7 @@ class Env:
         nbits = int(math.log2(self.num_batchsz))
         assert (1 << nbits) == self.num_batchsz, 'num batchsz must be 2^x'
         assert (1 << self.num_models) - \
-            1 == self.perf.shape[0], 'num of models not math perf file'
+            1 == self.perf.size, 'num of models not math perf file'
         self.state_size = 1
 
         assert len(batchsz) == self.num_batchsz, \
@@ -259,11 +259,12 @@ class Env:
 class Envs(object):
     # a list of envs
 
-    def __init__(self, num_processes, num_models, policy, obs_size, cycle=200):
+    def __init__(self, num_processes, num_models, policy, alpha, obs_size, cycle=200):
         self.num_processes = num_processes
-        batchsz = range(16, 65, 16)[:num_models]
+        batchsz = range(16, 65, 16)
         latency = np.loadtxt('latency.txt', delimiter=',')[:num_models]
-        perf = np.loadtxt('accuracy.txt', delimiter=',')[:num_models]
+        perf = np.loadtxt('accuracy.txt', delimiter=',')[
+            :(1 << num_models) - 1]
         max_rate = sum([batchsz[-1] / l[-1] for l in latency])
         # min when all models are running the same data
         min_rate = min([batchsz[0] / l[0] for l in latency])
@@ -279,13 +280,13 @@ class Envs(object):
         for i in range(self.num_processes):
             timer = Timer()
             if policy == 'sync':
-                requests_gen = RequestGenerator(timer, 5000, min_rate, T)
+                requests_gen = RequestGenerator(timer, min_rate, T)
                 env = Env(requests_gen, timer, batchsz,
-                          tau, latency, perf, obs_size=obs_size)
+                          tau, latency, perf, alpha, obs_size=obs_size)
             else:
-                requests_gen = RequestGenerator(timer, 5000, max_rate, T)
+                requests_gen = RequestGenerator(timer, max_rate, T)
                 env = Env(requests_gen, timer, batchsz,
-                          tau, latency, perf, obs_size=obs_size)
+                          tau, latency, perf, alpha, obs_size=obs_size)
             self.envs.append(env)
         self.observation_space = self.envs[0].observation_space
         self.action_space = self.envs[0].action_space
@@ -357,7 +358,7 @@ if __name__ == '__main__':
         description='Request serving policy optimization.')
     parser.add_argument(
         '--policy', choices=['async', 'sync'], default='sync', help='policy')
-    parser.add_argument('--obs_size', type=int, default=50,
+    parser.add_argument('--obs_size', type=int, default=200,
                         help='observation vector size')
     parser.add_argument('--epoch', type=int, default=3)
     parser.add_argument('--debug', action='store_true')
@@ -389,7 +390,8 @@ if __name__ == '__main__':
 
     batchsz = range(16, 65, 16)
     latency = np.loadtxt('latency.txt', delimiter=',')[:args.num_models]
-    perf = np.loadtxt('accuracy.txt', delimiter=',')[:args.num_models]
+    perf = np.loadtxt('accuracy.txt', delimiter=',')[
+        :(1 << args.num_models) - 1]
     max_rate = sum([batchsz[-1] / l[-1] for l in latency])
     # min when all models are running the same data
     min_rate = min([batchsz[0] / l[0] for l in latency])
@@ -404,14 +406,14 @@ if __name__ == '__main__':
     timer = Timer()
     if args.policy == 'sync':
         # always select all models
-        requests_gen = RequestGenerator(timer, 5000, min_rate, T)
+        requests_gen = RequestGenerator(timer, min_rate, T)
         env = Env(requests_gen, timer, batchsz,
                   tau, latency, perf, obs_size=args.obs_size)
         env.reset()
         sync_run(env, args.epoch * T)
     else:
         # select the free model
-        requests_gen = RequestGenerator(timer, 5000, max_rate, T)
+        requests_gen = RequestGenerator(timer, max_rate, T)
         env = Env(requests_gen, timer, batchsz,
                   tau, latency, perf, obs_size=args.obs_size)
         env.reset()
