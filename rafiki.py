@@ -172,16 +172,26 @@ class Env:
         """
         model_idx, batchsz_idx = self.parse_action(action)
 
+        batchsz = self.batchsz[batchsz_idx]
+
+        cur_time = self.timer.now()
+        while len(self.requests) == 0 or (len(self.requests) < batchsz and
+                                          self.timer.now() - self.requests[0][1] +
+                                          np.max(self.waiting_time[model_idx] +
+                                                 self.latency[model_idx, batchsz_idx])
+                                          + 0.2 < self.tau):
+            self.timer.tick(0.05)
+            self.waiting_time -= 0.05
+            self.update_obs()
+        mask = self.waiting_time >= 0
+        self.waiting_time *= mask
         # inc the processing time of the selected models
         self.waiting_time[model_idx] += self.latency[model_idx, batchsz_idx]
-
-        batchsz = self.batchsz[batchsz_idx]
-        num_overdue = 0
-        cur_time = self.timer.now()
         # the latency of this batch of requests depends on the slowest model
         max_waiting_time = np.max(self.waiting_time[model_idx])
-
-        num = min(batchsz, len(self.requests))
+        cur_time = self.timer.now()
+        num = min(len(self.requests), batchsz)
+        num_overdue = 0
         for _, inqueue_time in self.requests[:num]:
             latency = cur_time - inqueue_time + max_waiting_time
             if latency > self.tau:
@@ -311,7 +321,7 @@ class Envs(object):
         return ret
 
 
-def step(env, model_idx, sync):
+def greedy_step(env, model_idx, sync):
     # greedy algorithm
     # choose biggest batchsz and smallest waiting queue
     action = None
@@ -339,19 +349,43 @@ def step(env, model_idx, sync):
     return env.step(action, sync)
 
 
+def clipper_step(env, model_idx, sync):
+    # greedy algorithm
+    # choose biggest batchsz and smallest waiting queue
+    action = None
+    while action is None:
+        tick = False
+        k = env.num_batchsz - 1
+        bs = env.batchsz[-1]
+        if bs <= len(env.requests):
+            '''
+            if bs < len(env.requests) and (k + 1) < env.num_batchsz:
+                action = env.create_action(model_idx, k + 1)
+            else:
+            '''
+            action = env.create_action(model_idx, k)
+        else:
+            env.timer.tick(0.1)
+            env.update_obs()
+
+    return env.step(action, sync)
+
+
+
 def sync_run(evn, stop_time):
     while env.timer.now() < stop_time:
-        _, r, _, info = step(env, np.ones((env.num_models), dtype=bool), True)
+        _, r, _, info = clipper_step(env, np.ones((env.num_models), dtype=bool), True)
 
 
 def async_run(env, stop_time):
     # always use all models
     while env.timer.now() < stop_time:
+        # greedy
         # choose biggest batchsz and smallest waiting queue
         model_action = np.zeros((env.num_models), dtype=bool)
         model_action[np.argmin(env.waiting_time)] = True
         # print(np.argmin(env.waiting_time))
-        _, r, _, info = step(env, model_action, False)
+        _, r, _, info = clipper_step(env, model_action, False)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
@@ -406,7 +440,7 @@ if __name__ == '__main__':
     timer = Timer()
     if args.policy == 'sync':
         # always select all models
-        requests_gen = RequestGenerator(timer, min_rate, T)
+        requests_gen = RequestGenerator(timer, min_rate, T)  # NEED to change min_rate to max_rate to run Clipper
         env = Env(requests_gen, timer, batchsz,
                   tau, latency, perf, obs_size=args.obs_size)
         env.reset()
