@@ -1,5 +1,4 @@
 import numpy as np
-# from scipy import integrate
 import random
 import math
 import argparse
@@ -38,7 +37,9 @@ class RequestGenerator(object):
     def __init__(self, timer, rate, T, sigma=0.1, mu=0.01, seed=1):
         # timer, is shared with the env
         # rate, is the reference throughput
-        # self.cur_req_id = 1
+        # sigma, decide the max arriving rate which is bigger than the max reference throughput
+        # mu, is the pram of Gauss function
+
         self.timer = timer
         self.T = T
         self.mu = mu
@@ -49,8 +50,6 @@ class RequestGenerator(object):
 
         self.last_timestamp = timer.now()
         random.seed(seed)
-        # the func should range from 0 to 1
-        # T = 2*pi/w
 
     def num_of_new_requests(self, delta):
         # 20% time the arriving rate is larger than the reference throughput
@@ -58,7 +57,7 @@ class RequestGenerator(object):
         w = 2 * np.pi / self.T
         num = math.sin(w * x) * self.k + self.b
         num = int(max(0, num * (1 + random.gauss(0, self.mu))))
-        return int(num * delta)
+        return int(num * delta+0.5)
 
     def reset(self):
         self.last_timestamp = self.timer.now()
@@ -70,7 +69,6 @@ class RequestGenerator(object):
         """
 
         cur_time = self.timer.now()
-        # num_float = integrate.quad(self.func, self.last_timestamp, cur_time)[0]
         # to make the requests unifromly located in [last_timestamp, now)
         num = self.num_of_new_requests(cur_time - self.last_timestamp)
         new_req = [(random.randint(0, 4999),  # hard code the request id range, here
@@ -92,13 +90,14 @@ env_id = 0
 
 class Env:
 
-    def __init__(self, requests_gen, timer, batchsz, tau, latency, perf, alpha=0.5, obs_size=50):
+    def __init__(self, requests_gen, timer, batchsz, tau, latency, max_latency, perf, beta=0.5, obs_size=50):
         self.requests_gen = requests_gen
         self.timer = timer
         self.batchsz = batchsz  # a list of candidate batchsz
         self.tau = tau  # time limit of each request
-        self.alpha = alpha  # coefficient of the overdue requests in the reward function
+        self.beta = beta  # coefficient of the overdue requests in the reward function
         self.obs_size = obs_size  # valid queue length for queue feature into the RL model
+        self.max_latency = max_latency
 
         self.latency = latency  # a matrix with one row per model, one column per batchsz
         self.perf = perf  # a list performance/accuracy for (ensemble) model
@@ -107,9 +106,7 @@ class Env:
         self.num_batchsz = self.latency.shape[1]
         nbits = int(math.log2(self.num_batchsz))
         assert (1 << nbits) == self.num_batchsz, 'num batchsz must be 2^x'
-        assert (1 << self.num_models) - \
-            1 == self.perf.size, 'num of models not math perf file'
-        self.state_size = 1
+        assert (1 << self.num_models) - 1 == self.perf.size, 'num of models not math perf file'
 
         assert len(batchsz) == self.num_batchsz, \
             'batchsz %d not match latency shape' % len(batchsz)
@@ -118,14 +115,12 @@ class Env:
         # the action for model selection and for batchsz selection is merged
         # with the first num_models bits for model selection and the last
         # log2(num_batchsz) for batch selection.
-        self.action_space = Discrete(
-            ((1 << self.num_models) - 1) * self.num_batchsz)
+        self.action_space = Discrete(((1 << self.num_models) - 1) * self.num_batchsz)
 
         # the obs space includes the tau, latency for all models and all
         # batchsz, waiting time of each model to finish existing requests and
         # the queue states (queuing time)
-        self.observation_space = np.zeros(
-            (self.obs_size + self.latency.size + self.num_models + 1, ))
+        self.observation_space = np.zeros((self.obs_size + self.latency.size + self.num_models + 1, ))
 
         # self.reset()
         global env_id
@@ -171,34 +166,45 @@ class Env:
           :return: obs s1 and cost c1
         """
         model_idx, batchsz_idx = self.parse_action(action)
-
         batchsz = self.batchsz[batchsz_idx]
+        self.logger.info("time: %.5f" % self.timer.now())
+        self.logger.info("len_req: %d" % len(self.requests))
+        self.logger.info("action: %d" % action)
+        self.logger.info("model %s batch_size %d" % (str(model_idx), self.batchsz[batchsz_idx]))
+        if len(self.requests)!=0:
+            self.logger.info("max_queue_wait: %.5f" %(float(self.timer.now()) - self.requests[0][1]))
 
         cur_time = self.timer.now()
         while len(self.requests) == 0 or (len(self.requests) < batchsz and
                                           self.timer.now() - self.requests[0][1] +
                                           np.max(self.waiting_time[model_idx] +
                                                  self.latency[model_idx, batchsz_idx])
-                                          + 0.2 < self.tau):
+                                          + 0.1 * self.tau < self.tau):
             self.timer.tick(0.05)
             self.waiting_time -= 0.05
             self.update_obs()
-        mask = self.waiting_time >= 0
-        self.waiting_time *= mask
+
         # inc the processing time of the selected models
         self.waiting_time[model_idx] += self.latency[model_idx, batchsz_idx]
         # the latency of this batch of requests depends on the slowest model
-        max_waiting_time = np.max(self.waiting_time[model_idx])
+        max_process_time = np.max(self.waiting_time[model_idx])
         cur_time = self.timer.now()
         num = min(len(self.requests), batchsz)
         num_overdue = 0
+        due_time = []
+        overdue_time = []
         for _, inqueue_time in self.requests[:num]:
-            latency = cur_time - inqueue_time + max_waiting_time
-            if latency > self.tau:
+            latency = cur_time - inqueue_time + max_process_time
+            if latency > self.max_latency:
                 num_overdue += 1
+                overdue_time.append(latency)
+            else:
+                due_time.append(latency)
         acc = self.accuracy(self.requests[:num], model_idx)
 
-        reward = acc * num - self.alpha * acc * num_overdue
+        reward = acc * num - self.beta * acc * num_overdue
+
+        self.logger.info('reward %.3f num %d overdue %d' % (reward, num, num_overdue))
 
         # printing
         delta = self.timer.now() - self.last_log_time
@@ -206,40 +212,68 @@ class Env:
         self.logt += num
         self.logo += num_overdue
         self.loga += acc * num
+        self.wait = self.waiting_time
+        if len(self.requests)!=0:
+            max_queue_wait = float(self.timer.now()) - self.requests[0][1]
+        else:
+            max_queue_wait = 0
+
+        self.wait = np.append(self.wait,max_queue_wait)
+        self.wait = np.append(self.wait, max_process_time)
+        self.wait = np.append(self.wait, max_process_time + max_queue_wait)
+        self.actions.append(action)
         if delta >= 1:
-            self.logger.info('time %5.1f, reward %5.1f, acc %5.3f, overdue %5.1f, throughput %5.1f, arr rate %5.1f, queue size %d, batchsz %d' %
-                             (self.timer.now(), self.logr / delta,
-                              self.loga / self.logt, self.logo / delta,
-                              self.logt / delta,
-                              self.requests_gen.num_of_new_requests(1),
-                              len(self.requests), batchsz))
+            self.wait = self.wait.reshape((-1,6))
+            self.wait = self.wait.T
+            self.info = {
+                'time': '%.10f' % self.timer.now(),
+                'num': '%.2d' % self.logt,
+                'overdue': '%.2d' % self.logo,
+                'overdue_rate': '%.5f' % (self.logo / delta),
+                'accu': '%.5f' % (self.loga / self.logt),
+                'reward': '%3.5f' % (self.logr / delta),
+                'throughput': '%4.5f' % (self.logt / delta),
+                'arrive_rate': '%.3d' % self.requests_gen.num_of_new_requests(1),
+                'len_q': '%.3d' % len(self.requests),
+                'batchsz': '%.2d' % batchsz,
+                'model_num': sum(model_idx),
+                'actions': self.actions,
+                'wait': self.wait
+             }
+            # self.logger.info(self.info)
             self.last_log_time = self.timer.now()
-            self.logr, self.logt, self.logo, self.loga = 0, 0, 0, 0
+            self.logr, self.logt, self.logo, self.loga, self.actions, self.wait = 0, 0, 0, 0, [], []
 
         # update timer to proceed with the next RL iter
         if sync:
-            delta = self.waiting_time
-            self.timer.tick(np.max(delta))
+            tick_time = np.max(self.waiting_time)
         else:
-            delta = np.min(self.waiting_time)
-            self.timer.tick(delta)
+            tick_time = np.min(self.waiting_time)
+
+        self.timer.tick(tick_time)
 
         # delta time has passed
-        self.waiting_time -= delta
+        self.waiting_time -= tick_time
         # delete the dispatched requests from the queue
         self.requests = self.requests[num:]
         # update env queue status with new requests
         self.update_obs()
+
         # obs, reward, done, _
-        return self.obs, reward, False, \
-            {'acc': acc, 'overdue': num_overdue, 'batchsz': num,
-             'num_models': sum(model_idx), 'time': cur_time}
+        if delta >= 1:
+            return self.obs, reward, self.info
+        else:
+            return self.obs, reward, None
+
+
 
     def update_obs(self):
+        mask = self.waiting_time >= 0
+        self.waiting_time *= mask
+
         new_req = self.requests_gen.get()
         total_size = len(new_req) + len(self.requests)
-        assert total_size < 100 * self.obs_size, \
-            'too many requests %d' % total_size
+        assert total_size < 2000 * self.obs_size, 'too many requests %d' % total_size
         self.requests.extend(new_req)
         size = min(self.obs_size, total_size)
 
@@ -260,7 +294,7 @@ class Env:
         self.requests = []
         self.waiting_time = np.zeros((self.num_models, ))
         self.last_log_time = self.timer.now()
-        self.logr, self.logt, self.logo, self.loga = 0, 0, 0, 0
+        self.logr, self.logt, self.logo, self.loga, self.actions, self.wait = 0, 0, 0, 0, [], []
         self.timer.tick(self.tau / 5)
         self.update_obs()
         return self.obs
@@ -268,35 +302,36 @@ class Env:
 
 class Envs(object):
     # a list of envs
-
-    def __init__(self, num_processes, num_models, policy, alpha, obs_size, cycle=200):
+    def __init__(self, num_processes, num_models, policy, beta, obs_size, max_latency, tau_times, cycle=200):
         self.num_processes = num_processes
         batchsz = range(16, 65, 16)
         latency = np.loadtxt('latency.txt', delimiter=',')[:num_models]
-        perf = np.loadtxt('accuracy.txt', delimiter=',')[
-            :(1 << num_models) - 1]
+        perf = np.loadtxt('accuracy.txt', delimiter=',')[:(1 << num_models) - 1]
+        # max when every model is running the different data
         max_rate = sum([batchsz[-1] / l[-1] for l in latency])
         # min when all models are running the same data
-        min_rate = min([batchsz[0] / l[0] for l in latency])
+        min_rate = max([batchsz[0] / l[0] for l in latency])
         logger.info('max process rate: %f' % max_rate)
         logger.info('min process rate: %f' % min_rate)
 
-        tau = np.max(latency) * 2
+        tau = np.max(latency) * tau_times
         # num_of_iters = obs_size / batchsz[-1]
         T = tau * cycle
         logger.info('sin cycle %f' % T)
-        # (pi/2 - asin(0.9)) / pi = 1 / 7 is the peak fraction
+
         self.envs = []
+        self.sync_policy = False
         for i in range(self.num_processes):
             timer = Timer()
             if policy == 'sync':
+                self.sync_policy = True
                 requests_gen = RequestGenerator(timer, min_rate, T)
                 env = Env(requests_gen, timer, batchsz,
-                          tau, latency, perf, alpha, obs_size=obs_size)
+                          tau, latency, max_latency, perf, beta, obs_size=obs_size)
             else:
                 requests_gen = RequestGenerator(timer, max_rate, T)
                 env = Env(requests_gen, timer, batchsz,
-                          tau, latency, perf, alpha, obs_size=obs_size)
+                          tau, latency, max_latency, perf, beta, obs_size=obs_size)
             self.envs.append(env)
         self.observation_space = self.envs[0].observation_space
         self.action_space = self.envs[0].action_space
@@ -304,15 +339,13 @@ class Envs(object):
     def step(self, actions):
         obs = np.empty((self.num_processes, self.observation_space.shape[0]))
         reward = np.empty((self.num_processes))
-        done = np.empty((self.num_processes))
         info = []
         for k, env in enumerate(self.envs):
-            o, r, d, s = env.step(actions[k])
+            o, r, i = env.step(actions[k],self.sync_policy)
             obs[k, :] = o
             reward[k] = r
-            done[k] = d
-            info.append(s)
-        return obs, reward, done, info
+            info.append(i)
+        return obs, reward, info
 
     def reset(self):
         ret = np.empty((self.num_processes, self.observation_space.shape[0]))
@@ -321,6 +354,7 @@ class Envs(object):
         return ret
 
 
+# The following functions are used for unit testing
 def greedy_step(env, model_idx, sync):
     # greedy algorithm
     # choose biggest batchsz and smallest waiting queue
@@ -348,7 +382,6 @@ def greedy_step(env, model_idx, sync):
 
     return env.step(action, sync)
 
-
 def clipper_step(env, model_idx, sync):
     # greedy algorithm
     # choose biggest batchsz and smallest waiting queue
@@ -370,12 +403,9 @@ def clipper_step(env, model_idx, sync):
 
     return env.step(action, sync)
 
-
-
 def sync_run(evn, stop_time):
     while env.timer.now() < stop_time:
         _, r, _, info = clipper_step(env, np.ones((env.num_models), dtype=bool), True)
-
 
 def async_run(env, stop_time):
     # always use all models
@@ -410,7 +440,7 @@ if __name__ == '__main__':
     ch.setFormatter(formatter)
     logger.addHandler(ch)
 
-    if not args.debug:
+    if args.debug:
         pathlib.Path('log').mkdir(parents=True, exist_ok=True)
         fh = logging.FileHandler('log/server-%s' %
                                  datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S"))
@@ -432,12 +462,17 @@ if __name__ == '__main__':
     logger.info('max process rate: %f' % max_rate)
     logger.info('min process rate: %f' % min_rate)
 
-    tau = np.max(latency) * 2
+    tau = np.max(latency) * 3
     # num_of_iters = args.obs_size / batchsz[-1]
     T = tau * args.cycle_len
     logger.info('sin cycle %f' % T)
     # (pi/2 - asin(0.9)) / pi = 1 / 7 is the peak fraction
     timer = Timer()
+
+    requests_gen = RequestGenerator(timer, max_rate, T)
+    for i in range(1000):
+        print(requests_gen.num_of_new_requests(1))
+
     if args.policy == 'sync':
         # always select all models
         requests_gen = RequestGenerator(timer, min_rate, T)  # NEED to change min_rate to max_rate to run Clipper
